@@ -3,7 +3,8 @@ defmodule Assent.Strategy.OAuth2 do
   OAuth 2.0 strategy.
 
   This strategy only supports the Authorization Code flow per
-  [RFC 6749](https://tools.ietf.org/html/rfc6749#section-1.3.1).
+  [RFC 6749](https://tools.ietf.org/html/rfc6749#section-1.3.1) with optional
+  PKCE support [RFC 7636](https://tools.ietf.org/html/rfc7636).
 
   `authorize_url/1` returns a map with a `:url` and `:session_params` key. The
   `:session_params` should be stored and passed back into `callback/3` as part
@@ -40,6 +41,7 @@ defmodule Assent.Strategy.OAuth2 do
     - `:jwt_algorithm` - The algorithm to use for JWT signing, optional,
       defaults to `HS256` for `:client_secret_jwt` and `RS256` for
       `:private_key_jwt`
+    - `:use_pkce` - Enables Proof Key for Code Exchange (PKCE).
 
   ## Usage
 
@@ -65,7 +67,7 @@ defmodule Assent.Strategy.OAuth2 do
   @behaviour Assent.Strategy
 
   alias Assent.Strategy, as: Helpers
-  alias Assent.{CallbackCSRFError, CallbackError, Config, HTTPAdapter.HTTPResponse, JWTAdapter, MissingParamError, RequestError}
+  alias Assent.{CallbackCSRFError, CallbackError, Config, HTTPAdapter.HTTPResponse, JWTAdapter, CallbackPkceError, MissingParamError, RequestError}
 
   @doc """
   Generate authorization URL for request phase.
@@ -79,37 +81,55 @@ defmodule Assent.Strategy.OAuth2 do
     - `:authorization_params` - The authorization parameters, defaults to `[]`
   """
   @impl true
-  @spec authorize_url(Config.t()) :: {:ok, %{session_params: %{state: binary()}, url: binary()}} | {:error, term()}
+  @spec authorize_url(Config.t()) :: {:ok, %{session_params: %{state: binary(), code_verifier: binary() | nil}, url: binary()}} | {:error, term()}
   def authorize_url(config) do
     with {:ok, redirect_uri} <- Config.fetch(config, :redirect_uri),
          {:ok, site}         <- Config.fetch(config, :site),
          {:ok, client_id}    <- Config.fetch(config, :client_id) do
-      params        = authorization_params(config, client_id, redirect_uri)
+      code_verifier = maybe_gen_code_verifier(config)
+      params        = authorization_params(config, client_id, redirect_uri, code_verifier)
       authorize_url = Config.get(config, :authorize_url, "/oauth/authorize")
       url           = Helpers.to_url(site, authorize_url, params)
 
-      {:ok, %{url: url, session_params: %{state: params[:state]}}}
+      {:ok, %{url: url, session_params: %{state: params[:state], code_verifier: code_verifier}}}
     end
   end
 
-  defp authorization_params(config, client_id, redirect_uri) do
+  defp authorization_params(config, client_id, redirect_uri, code_verifier) do
     params = Config.get(config, :authorization_params, [])
 
     [
       response_type: "code",
       client_id: client_id,
-      state: gen_state(),
+      state: gen_random_secret(),
       redirect_uri: redirect_uri]
+    |> maybe_set_code_challenge(code_verifier)
     |> Keyword.merge(params)
     |> List.keysort(0)
   end
 
-  defp gen_state do
+  defp gen_random_secret do
     24
     |> :crypto.strong_rand_bytes()
     |> :erlang.bitstring_to_list()
     |> Enum.map_join(fn x -> :erlang.integer_to_binary(x, 16) end)
     |> String.downcase()
+  end
+
+  defp maybe_set_code_challenge(params, nil), do: params
+  defp maybe_set_code_challenge(params, code_verifier) do
+    # padding intentionally removed (https://www.rfc-editor.org/rfc/rfc7636#appendix-A)
+    code_challenge = :crypto.hash(:sha256, code_verifier) |> Base.url_encode64(padding: false)
+
+    params
+    |> Keyword.merge([code_challenge: code_challenge, code_challenge_method: "S256"])
+  end
+
+  defp maybe_gen_code_verifier(config) do
+    case Config.get(config, :use_pkce, false) do
+      true  -> Config.get(config, :code_verifier, gen_random_secret())
+      false -> nil
+    end
   end
 
   @doc """
@@ -132,10 +152,30 @@ defmodule Assent.Strategy.OAuth2 do
          :ok                   <- check_error_params(params),
          {:ok, code}           <- fetch_code_param(params),
          {:ok, redirect_uri}   <- Config.fetch(config, :redirect_uri),
+         {:ok, code_verifier}  <- maybe_fetch_code_verifier(config, session_params),
          :ok                   <- maybe_check_state(session_params, params),
-         {:ok, token}          <- grant_access_token(config, "authorization_code", code: code, redirect_uri: redirect_uri) do
+         params                <- [code: code, redirect_uri: redirect_uri] |> maybe_add_code_verifier(code_verifier),
+         {:ok, token}          <- grant_access_token(config, "authorization_code", params) do
 
       fetch_user_with_strategy(config, token, strategy)
+    end
+  end
+
+  defp maybe_add_code_verifier(params, nil), do: params
+  defp maybe_add_code_verifier(params, code_verifier) do
+    params
+    |> Keyword.put(:code_verifier, code_verifier)
+  end
+
+  defp maybe_fetch_code_verifier(config, params) do
+    case Config.get(config, :use_pkce, false) do
+      true  ->
+        case Map.fetch(params, :code_verifier) do
+          {:ok, nil}   -> {:error, CallbackPkceError.new("code_verifier")}
+          {:ok, value} -> {:ok, value}
+          :error       -> {:error, MissingParamError.new("code_verifier", params)}
+        end
+      false -> {:ok, nil}
     end
   end
 

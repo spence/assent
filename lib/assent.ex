@@ -14,6 +14,15 @@ defmodule Assent do
     end
   end
 
+  defmodule CallbackPkceError do
+    defexception [:message]
+
+    @spec new(binary()) :: %__MODULE__{}
+    def new(key) do
+      %__MODULE__{message: "Invalid PKCE param key #{inspect key}"}
+    end
+  end
+
   defmodule MissingParamError do
     defexception [:message, :params]
 

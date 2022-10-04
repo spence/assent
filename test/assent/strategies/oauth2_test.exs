@@ -1,7 +1,7 @@
 defmodule Assent.Strategy.OAuth2Test do
   use Assent.Test.OAuth2TestCase
 
-  alias Assent.{CallbackCSRFError, CallbackError, Config.MissingKeyError, JWTAdapter.AssentJWT, MissingParamError, RequestError, Strategy.OAuth2}
+  alias Assent.{CallbackCSRFError, CallbackError, Config.MissingKeyError, JWTAdapter.AssentJWT, CallbackPkceError, MissingParamError, RequestError, Strategy.OAuth2}
 
   @client_id "s6BhdRkqt3"
   @client_secret "7Fjfp0ZBr1KtDRbnfVdmIw"
@@ -58,13 +58,30 @@ defmodule Assent.Strategy.OAuth2Test do
   end
 
   test "authorize_url/2 with state in authorization_param", %{config: config} do
-    assert {:ok, %{session_params: %{state: state}}} =
+    assert {:ok, %{session_params: %{state: state, code_verifier: code_verifier}}} =
       config
       |> Keyword.put(:client_id, @client_id)
       |> Keyword.put(:authorization_params, state: "state_test_value")
       |> OAuth2.authorize_url()
 
     assert state == "state_test_value"
+    assert is_nil(code_verifier)
+  end
+
+  test "authorize_url/2 with authorization code challenge", %{config: config} do
+    assert {:ok, %{url: url, session_params: %{code_verifier: code_verifier}}} =
+      config
+      |> Keyword.put(:client_id, @client_id)
+      |> Keyword.put(:use_pkce, true)
+      |> Keyword.put(:code_verifier, "test_code_verifier")
+      |> OAuth2.authorize_url()
+
+    query = URI.decode_query(URI.parse(url).query)
+    assert code_verifier == "test_code_verifier"
+    assert Map.has_key?(query, "code_challenge")
+    assert Map.has_key?(query, "code_challenge_method")
+    assert query["code_challenge"] == :crypto.hash(:sha256, "test_code_verifier") |> Base.url_encode64(padding: false)
+    assert query["code_challenge_method"] == "S256"
   end
 
   describe "callback/2" do
@@ -117,6 +134,24 @@ defmodule Assent.Strategy.OAuth2Test do
       assert error.message == "CSRF detected with param key \"state\""
     end
 
+    test "with pkce enabled and invalid code_verifier in session_params", %{config: config, callback_params: params} do
+      config = Keyword.put(config, :use_pkce, true)
+
+      assert {:error, %CallbackPkceError{} = error} = OAuth2.callback(config, params)
+      assert error.message == "Invalid PKCE param key \"code_verifier\""
+    end
+
+    test "with pkce enabled and missing code_verifier in session_params", %{config: config, callback_params: params} do
+      config = Keyword.put(config, :use_pkce, true)
+      session_params = Keyword.fetch!(config, :session_params)
+      session_params = Map.delete(session_params, :code_verifier)
+      config = Keyword.put(config, :session_params, session_params)
+
+      assert {:error, %MissingParamError{} = error} = OAuth2.callback(config, params)
+      assert error.message == "Expected \"code_verifier\" to exist in params, but only found the following keys: [:state]"
+      assert error.params == %{:state => "state_test_value"}
+    end
+
     test "with state param without state in session_params", %{config: config, callback_params: params} do
       config = Keyword.put(config, :session_params, %{})
 
@@ -129,6 +164,18 @@ defmodule Assent.Strategy.OAuth2Test do
     test "without state in params and session params", %{config: config, callback_params: params} do
       config = Keyword.put(config, :session_params, %{})
       params = Map.delete(params, "state")
+
+      expect_oauth2_access_token_request([])
+      expect_oauth2_user_request(%{})
+
+      assert {:ok, _any} = OAuth2.callback(config, params)
+    end
+
+    test "with pkce enabled and code_verifier in session_params", %{config: config, callback_params: params} do
+      config = Keyword.put(config, :use_pkce, true)
+      session_params = Keyword.fetch!(config, :session_params)
+      session_params = Map.put(session_params, :code_verifier, "test_code_verifier")
+      config = Keyword.put(config, :session_params, session_params)
 
       expect_oauth2_access_token_request([])
       expect_oauth2_user_request(%{})
